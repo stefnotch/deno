@@ -8,6 +8,7 @@ use std::sync::Arc;
 use deno_ast::ModuleSpecifier;
 use deno_core::anyhow::bail;
 use deno_core::error::AnyError;
+use deno_core::error::CoreError;
 use deno_core::futures::FutureExt;
 use deno_core::url::Url;
 use deno_core::v8;
@@ -17,6 +18,8 @@ use deno_core::FeatureChecker;
 use deno_core::ModuleLoader;
 use deno_core::PollEventLoopOptions;
 use deno_core::SharedArrayBufferStore;
+use deno_error::JsErrorBox;
+use deno_resolver::npm::DenoInNpmPackageChecker;
 use deno_runtime::code_cache;
 use deno_runtime::deno_broadcast_channel::InMemoryBroadcastChannel;
 use deno_runtime::deno_fs;
@@ -50,9 +53,10 @@ use crate::args::CliLockfile;
 use crate::args::DenoSubcommand;
 use crate::args::NpmCachingStrategy;
 use crate::args::StorageKeyResolver;
-use crate::errors;
 use crate::node::CliNodeResolver;
 use crate::node::CliPackageJsonResolver;
+use crate::npm::installer::NpmInstaller;
+use crate::npm::installer::PackageCaching;
 use crate::npm::CliNpmResolver;
 use crate::sys::CliSys;
 use crate::util::checksum;
@@ -80,9 +84,9 @@ pub trait ModuleLoaderFactory: Send + Sync {
 
 #[async_trait::async_trait(?Send)]
 pub trait HmrRunner: Send + Sync {
-  async fn start(&mut self) -> Result<(), AnyError>;
-  async fn stop(&mut self) -> Result<(), AnyError>;
-  async fn run(&mut self) -> Result<(), AnyError>;
+  async fn start(&mut self) -> Result<(), CoreError>;
+  async fn stop(&mut self) -> Result<(), CoreError>;
+  async fn run(&mut self) -> Result<(), CoreError>;
 }
 
 pub trait CliCodeCache: code_cache::CodeCache {
@@ -147,7 +151,8 @@ struct SharedWorkerState {
   maybe_lockfile: Option<Arc<CliLockfile>>,
   module_loader_factory: Box<dyn ModuleLoaderFactory>,
   node_resolver: Arc<CliNodeResolver>,
-  npm_resolver: Arc<dyn CliNpmResolver>,
+  npm_installer: Option<Arc<NpmInstaller>>,
+  npm_resolver: CliNpmResolver,
   pkg_json_resolver: Arc<CliPackageJsonResolver>,
   root_cert_store_provider: Arc<dyn RootCertStoreProvider>,
   root_permissions: PermissionsContainer,
@@ -164,18 +169,17 @@ impl SharedWorkerState {
   pub fn create_node_init_services(
     &self,
     node_require_loader: NodeRequireLoaderRc,
-  ) -> NodeExtInitServices<CliSys> {
+  ) -> NodeExtInitServices<DenoInNpmPackageChecker, CliNpmResolver, CliSys> {
     NodeExtInitServices {
       node_require_loader,
       node_resolver: self.node_resolver.clone(),
-      npm_resolver: self.npm_resolver.clone().into_npm_pkg_folder_resolver(),
       pkg_json_resolver: self.pkg_json_resolver.clone(),
       sys: self.sys.clone(),
     }
   }
 
   pub fn npm_process_state_provider(&self) -> NpmProcessStateProviderRc {
-    self.npm_resolver.clone().into_process_state_provider()
+    crate::npm::create_npm_process_state_provider(&self.npm_resolver)
   }
 }
 
@@ -195,7 +199,7 @@ impl CliMainWorker {
     Ok(())
   }
 
-  pub async fn run(&mut self) -> Result<i32, AnyError> {
+  pub async fn run(&mut self) -> Result<i32, CoreError> {
     let mut maybe_coverage_collector =
       self.maybe_setup_coverage_collector().await?;
     let mut maybe_hmr_runner = self.maybe_setup_hmr_runner().await?;
@@ -216,7 +220,7 @@ impl CliMainWorker {
         let result;
         select! {
           hmr_result = hmr_future => {
-            result = hmr_result;
+            result = hmr_result.map_err(Into::into);
           },
           event_loop_result = event_loop_future => {
             result = event_loop_result;
@@ -331,12 +335,12 @@ impl CliMainWorker {
     executor.execute().await
   }
 
-  pub async fn execute_main_module(&mut self) -> Result<(), AnyError> {
+  pub async fn execute_main_module(&mut self) -> Result<(), CoreError> {
     let id = self.worker.preload_main_module(&self.main_module).await?;
     self.worker.evaluate_module(id).await
   }
 
-  pub async fn execute_side_module(&mut self) -> Result<(), AnyError> {
+  pub async fn execute_side_module(&mut self) -> Result<(), CoreError> {
     let id = self.worker.preload_side_module(&self.main_module).await?;
     self.worker.evaluate_module(id).await
   }
@@ -393,7 +397,7 @@ impl CliMainWorker {
     &mut self,
     name: &'static str,
     source_code: &'static str,
-  ) -> Result<v8::Global<v8::Value>, AnyError> {
+  ) -> Result<v8::Global<v8::Value>, CoreError> {
     self.worker.js_runtime.execute_script(name, source_code)
   }
 }
@@ -422,7 +426,8 @@ impl CliMainWorkerFactory {
     maybe_lockfile: Option<Arc<CliLockfile>>,
     module_loader_factory: Box<dyn ModuleLoaderFactory>,
     node_resolver: Arc<CliNodeResolver>,
-    npm_resolver: Arc<dyn CliNpmResolver>,
+    npm_installer: Option<Arc<NpmInstaller>>,
+    npm_resolver: CliNpmResolver,
     pkg_json_resolver: Arc<CliPackageJsonResolver>,
     root_cert_store_provider: Arc<dyn RootCertStoreProvider>,
     root_permissions: PermissionsContainer,
@@ -446,6 +451,7 @@ impl CliMainWorkerFactory {
         maybe_lockfile,
         module_loader_factory,
         node_resolver,
+        npm_installer,
         npm_resolver,
         pkg_json_resolver,
         root_cert_store_provider,
@@ -465,7 +471,7 @@ impl CliMainWorkerFactory {
     &self,
     mode: WorkerExecutionMode,
     main_module: ModuleSpecifier,
-  ) -> Result<CliMainWorker, AnyError> {
+  ) -> Result<CliMainWorker, CoreError> {
     self
       .create_custom_worker(
         mode,
@@ -484,7 +490,7 @@ impl CliMainWorkerFactory {
     permissions: PermissionsContainer,
     custom_extensions: Vec<Extension>,
     stdio: deno_runtime::deno_io::Stdio,
-  ) -> Result<CliMainWorker, AnyError> {
+  ) -> Result<CliMainWorker, CoreError> {
     let shared = &self.shared;
     let CreateModuleLoaderResult {
       module_loader,
@@ -495,34 +501,33 @@ impl CliMainWorkerFactory {
     let main_module = if let Ok(package_ref) =
       NpmPackageReqReference::from_specifier(&main_module)
     {
-      if let Some(npm_resolver) = shared.npm_resolver.as_managed() {
+      if let Some(npm_installer) = &shared.npm_installer {
         let reqs = &[package_ref.req().clone()];
-        npm_resolver
+        npm_installer
           .add_package_reqs(
             reqs,
             if matches!(
               shared.default_npm_caching_strategy,
               NpmCachingStrategy::Lazy
             ) {
-              crate::npm::PackageCaching::Only(reqs.into())
+              PackageCaching::Only(reqs.into())
             } else {
-              crate::npm::PackageCaching::All
+              PackageCaching::All
             },
           )
           .await?;
       }
 
       // use a fake referrer that can be used to discover the package.json if necessary
-      let referrer =
-        ModuleSpecifier::from_directory_path(self.shared.fs.cwd()?)
-          .unwrap()
-          .join("package.json")?;
+      let referrer = ModuleSpecifier::from_directory_path(
+        self.shared.fs.cwd().map_err(JsErrorBox::from_err)?,
+      )
+      .unwrap()
+      .join("package.json")?;
       let package_folder = shared
         .npm_resolver
-        .resolve_pkg_folder_from_deno_module_req(
-          package_ref.req(),
-          &referrer,
-        )?;
+        .resolve_pkg_folder_from_deno_module_req(package_ref.req(), &referrer)
+        .map_err(JsErrorBox::from_err)?;
       let main_module = self
         .resolve_binary_entrypoint(&package_folder, package_ref.sub_path())?;
 
@@ -633,7 +638,6 @@ impl CliMainWorkerFactory {
       should_break_on_first_statement: shared.options.inspect_brk,
       should_wait_for_inspector_session: shared.options.inspect_wait,
       strace_ops: shared.options.strace_ops.clone(),
-      get_error_class_fn: Some(&errors::get_error_class_name),
       cache_storage_dir,
       origin_storage_dir,
       stdio,
@@ -834,7 +838,6 @@ fn create_web_worker_callback(
       create_web_worker_cb,
       format_js_error_fn: Some(Arc::new(format_js_error)),
       worker_type: args.worker_type,
-      get_error_class_fn: Some(&errors::get_error_class_name),
       stdio: stdio.clone(),
       cache_storage_dir,
       strace_ops: shared.options.strace_ops.clone(),
@@ -883,7 +886,11 @@ mod tests {
       ..Default::default()
     };
 
-    MainWorker::bootstrap_from_options::<CliSys>(
+    MainWorker::bootstrap_from_options::<
+      DenoInNpmPackageChecker,
+      CliNpmResolver,
+      CliSys,
+    >(
       main_module,
       WorkerServiceOptions {
         module_loader: Rc::new(FsModuleLoader),
