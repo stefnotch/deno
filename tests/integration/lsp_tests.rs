@@ -9937,6 +9937,74 @@ fn lsp_auto_imports_npm_auto() {
   client.shutdown();
 }
 
+// Regression test for https://github.com/denoland/deno/issues/23869.
+#[test]
+fn lsp_auto_imports_remote_dts() {
+  let context = TestContextBuilder::new()
+    .use_http_server()
+    .use_temp_cwd()
+    .build();
+  let temp_dir = context.temp_dir();
+  let mut client = context.new_lsp_command().build();
+  client.initialize_default();
+  client.did_open(json!({
+    "textDocument": {
+      "uri": temp_dir.url().join("file.ts").unwrap(),
+      "languageId": "typescript",
+      "version": 1,
+      "text": r#"
+        import "http://localhost:4545/subdir/imports_declaration/imports_interface.ts";
+        const a: SomeInterface
+      "#,
+    },
+  }));
+  client.write_request(
+    "workspace/executeCommand",
+    json!({
+      "command": "deno.cache",
+      "arguments": [[], temp_dir.url().join("file.ts").unwrap()],
+    }),
+  );
+  let list = client.get_completion_list(
+    temp_dir.url().join("file.ts").unwrap(),
+    (2, 21),
+    json!({ "triggerKind": 2 }),
+  );
+  assert!(!list.is_incomplete);
+  let item = list
+    .items
+    .iter()
+    .find(|item| item.label == "SomeInterface")
+    .unwrap();
+  let res = client.write_request("completionItem/resolve", json!(item));
+  assert_eq!(
+    res,
+    json!({
+      "label": "SomeInterface",
+      "labelDetails": {
+        "description": "http://localhost:4545/subdir/imports_declaration/interface.d.ts",
+      },
+      "kind": 8,
+      "detail": "interface SomeInterface",
+      "documentation": {
+        "kind": "markdown",
+        "value": "",
+      },
+      "sortText": "￿16_1",
+      "additionalTextEdits": [
+        {
+          "range": {
+            "start": { "line": 2, "character": 0 },
+            "end": { "line": 2, "character": 0 },
+          },
+          "newText": "        import { SomeInterface } from \"http://localhost:4545/subdir/imports_declaration/interface.d.ts\";\n",
+        },
+      ],
+    }),
+  );
+  client.shutdown();
+}
+
 #[test]
 fn lsp_npm_specifier_unopened_file() {
   let context = TestContextBuilder::new()
@@ -11623,6 +11691,46 @@ fn lsp_format_exclude_default_config() {
 }
 
 #[test]
+fn lsp_format_untitled() {
+  let context = TestContextBuilder::new().use_temp_cwd().build();
+  let mut client = context.new_lsp_command().build();
+  client.initialize_default();
+  client.did_open(json!({
+    "textDocument": {
+      "uri": "untitled:Untitled-1",
+      "languageId": "typescript",
+      "version": 1,
+      "text": "  console.log();\n",
+    },
+  }));
+  let res = client.write_request(
+    "textDocument/formatting",
+    json!({
+      "textDocument": {
+        "uri": "untitled:Untitled-1",
+      },
+      "options": {
+        "tabSize": 2,
+        "insertSpaces": true,
+      },
+    }),
+  );
+  assert_eq!(
+    res,
+    json!([
+      {
+        "range": {
+          "start": { "line": 0, "character": 0 },
+          "end": { "line": 0, "character": 2 },
+        },
+        "newText": "",
+      },
+    ])
+  );
+  client.shutdown();
+}
+
+#[test]
 fn lsp_format_json() {
   let context = TestContextBuilder::new().use_temp_cwd().build();
   let temp_dir = context.temp_dir();
@@ -11889,13 +11997,22 @@ fn lsp_format_html() {
 fn lsp_format_css() {
   let context = TestContextBuilder::new().use_temp_cwd().build();
   let temp_dir = context.temp_dir();
-  let file = source_file(temp_dir.path().join("file.css"), "  foo {}");
+  let css_file = source_file(temp_dir.path().join("file.css"), "  foo {}\n");
+  let scss_file = source_file(temp_dir.path().join("file.scss"), "  $font-stack: Helvetica, sans-serif;\n\nbody {\n  font: 100% $font-stack;\n}\n");
+  let sass_file = source_file(
+    temp_dir.path().join("file.sass"),
+    "  $font-stack: Helvetica, sans-serif\n\nbody\n  font: 100% $font-stack\n",
+  );
+  let less_file = source_file(
+    temp_dir.path().join("file.less"),
+    "  @width: 10px;\n\n#header {\n  width: @width;\n}\n",
+  );
   let mut client = context.new_lsp_command().build();
   client.initialize_default();
   let res = client.write_request(
     "textDocument/formatting",
     json!({
-      "textDocument": { "uri": file.url() },
+      "textDocument": { "uri": css_file.url() },
       "options": {
         "tabSize": 2,
         "insertSpaces": true,
@@ -11912,12 +12029,71 @@ fn lsp_format_css() {
         },
         "newText": "",
       },
+    ]),
+  );
+  let res = client.write_request(
+    "textDocument/formatting",
+    json!({
+      "textDocument": { "uri": scss_file.url() },
+      "options": {
+        "tabSize": 2,
+        "insertSpaces": true,
+      },
+    }),
+  );
+  assert_eq!(
+    res,
+    json!([
       {
         "range": {
-          "start": { "line": 0, "character": 8 },
-          "end": { "line": 0, "character": 8 },
+          "start": { "line": 0, "character": 0 },
+          "end": { "line": 0, "character": 2 },
         },
-        "newText": "\n",
+        "newText": "",
+      },
+    ]),
+  );
+  let res = client.write_request(
+    "textDocument/formatting",
+    json!({
+      "textDocument": { "uri": sass_file.url() },
+      "options": {
+        "tabSize": 2,
+        "insertSpaces": true,
+      },
+    }),
+  );
+  assert_eq!(
+    res,
+    json!([
+      {
+        "range": {
+          "start": { "line": 0, "character": 0 },
+          "end": { "line": 0, "character": 2 },
+        },
+        "newText": "",
+      },
+    ]),
+  );
+  let res = client.write_request(
+    "textDocument/formatting",
+    json!({
+      "textDocument": { "uri": less_file.url() },
+      "options": {
+        "tabSize": 2,
+        "insertSpaces": true,
+      },
+    }),
+  );
+  assert_eq!(
+    res,
+    json!([
+      {
+        "range": {
+          "start": { "line": 0, "character": 0 },
+          "end": { "line": 0, "character": 2 },
+        },
+        "newText": "",
       },
     ]),
   );
@@ -17084,4 +17260,39 @@ fn lsp_wasm_module() {
     ])
   );
   client.shutdown();
+}
+
+#[test]
+fn wildcard_augment() {
+  let context = TestContextBuilder::new().use_temp_cwd().build();
+  let mut client = context.new_lsp_command().build();
+  let temp_dir = context.temp_dir().path();
+  let source = source_file(
+    temp_dir.join("index.ts"),
+    r#"
+      import styles from "./hello_world.scss";
+
+      function bar(v: string): string {
+        return v;
+      }
+
+      bar(styles);
+    "#,
+  );
+  temp_dir.join("index.d.ts").write(
+    r#"
+      declare module '*.scss' {
+        const content: string;
+        export default content;
+      }
+    "#,
+  );
+  temp_dir
+    .join("hello_world.scss")
+    .write("body { color: red; }");
+
+  client.initialize_default();
+
+  let diagnostics = client.did_open_file(&source);
+  assert_eq!(diagnostics.all().len(), 0);
 }
